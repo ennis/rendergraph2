@@ -3,45 +3,49 @@ pub mod node;
 use crate::error::Error;
 use crate::error::Result;
 use crate::network::node::NodeOps;
-use specs::world::Builder;
-use specs::{Component, VecStorage};
+use slotmap::{SecondaryMap, SlotMap};
+use std::any::Any;
+use std::marker::PhantomData;
 use std::path::Path;
 
-/// Identifiers for Nodes
+slotmap::new_key_type! {
+    pub struct GenericNodeId;
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 #[repr(transparent)]
-pub struct NodeId(specs::world::Entity);
+pub struct NodeId<T>(pub GenericNodeId, PhantomData<T>);
 
-/// Identifiers for a parameter within a node
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-#[repr(transparent)]
-pub struct ParamId(u32);
+impl<T> From<NodeId<T>> for GenericNodeId {
+    fn from(id: NodeId<T>) -> Self {
+        id.0
+    }
+}
 
-type Depgraph = petgraph::graphmap::DiGraphMap<(NodeId, ParamId), ()>;
+type Depgraph = petgraph::graphmap::DiGraphMap<GenericNodeId, ()>;
 
-pub struct Node {
+pub struct NodeHierarchy {
     /// Name of the node.
-    ///
     /// Can be empty, in which case the node cannot be accessed by path, but only via an identifier.
     name: String,
     /// Parent node, None if this is the root node
-    parent: Option<NodeId>,
+    parent: Option<GenericNodeId>,
     /// Child nodes. If it's empty, then the node is a leaf node. Otherwise, it also represents a subnetwork.
-    children: Vec<NodeId>,
+    children: Vec<GenericNodeId>,
 }
 
-impl Node {
+impl NodeHierarchy {
     /// Creates a root node (no parent).
-    pub(super) fn new_root() -> Node {
-        Node {
+    pub(super) fn new_root() -> NodeHierarchy {
+        NodeHierarchy {
             name: String::new(),
             parent: None,
             children: Vec::new(),
         }
     }
 
-    pub(super) fn with_parent(name: impl Into<String>, parent: NodeId) -> Node {
-        Node {
+    pub(super) fn with_parent(name: impl Into<String>, parent: GenericNodeId) -> NodeHierarchy {
+        NodeHierarchy {
             name: name.into(),
             parent: Some(parent),
             children: Vec::new(),
@@ -49,12 +53,12 @@ impl Node {
     }
 
     /// Returns whether the node contains a subnetwork.
-    pub fn is_subnet(&self) -> bool {
+    pub fn has_subnet(&self) -> bool {
         !self.children.is_empty()
     }
 
     /// Returns the parent node.
-    pub fn parent(&self) -> Option<NodeId> {
+    pub fn parent(&self) -> Option<GenericNodeId> {
         self.parent
     }
 
@@ -64,118 +68,82 @@ impl Node {
     }
 }
 
-impl Component for Node {
-    type Storage = VecStorage<Self>;
-}
-
 pub struct Network {
-    /// specs::World managing the node components.
-    w: specs::World,
-
-    /// Identifier of the root node.
-    root: NodeId,
-
-    /// Dependency graph between node parameters.
-    ///
-    /// It tracks the dependent values of parameters in nodes. (i.e. which parameters should be recomputed
-    /// as soon as the value of a parameter changes).
-    ///
-    /// The graph should be invalidated as soon as a node is removed.
+    hierarchy: slotmap::SlotMap<GenericNodeId, NodeHierarchy>,
+    data: slotmap::SecondaryMap<GenericNodeId, Box<dyn Any>>,
+    root: GenericNodeId,
     depgraph: Depgraph,
-}
-
-pub trait IntoNodeId {
-    fn resolve(&self, n: &NetworkScope) -> NodeId;
-}
-
-impl IntoNodeId for NodeId {
-    fn resolve(&self, _: &NetworkScope) -> NodeId {
-        *self
-    }
 }
 
 impl Network {
     /// Creates a new node network.
     pub fn new() -> Network {
-        let mut w = specs::World::new();
-
-        // register all components that make up a node
-        // the hierarchy links (parent and children)
-        w.register::<Node>();
-
-        // create root node
-        let root = NodeId(w.create_entity().with(Node::new_root()).build());
+        let mut hierarchy = SlotMap::with_key();
+        let root = hierarchy.insert(NodeHierarchy::new_root());
+        let data = SecondaryMap::new();
 
         Network {
-            w,
+            hierarchy,
+            data,
             depgraph: Depgraph::new(),
             root,
         }
     }
 
     /// Returns the root node identifier of this network.
-    pub fn root_node(&self) -> NodeId {
-        self.root
-    }
-
-    pub fn open_root(&mut self) -> NetworkScope {
+    pub fn root_node(&mut self) -> Node {
         let id = self.root;
-        NetworkScope { network: self, id }
+        Node { network: self, id }
     }
 
-    fn add_named_node(&mut self, name: impl Into<String>, parent: NodeId) -> Result<NodeId> {
-        let nid = NodeId(
-            self.w
-                .create_entity()
-                .with(Node::with_parent(name, parent))
-                .build(),
-        );
-        let mut node_storage = self.w.write_storage::<Node>();
-        node_storage
-            .get_mut(parent.0)
-            .ok_or(Error::IdNotFound)?
-            .children
-            .push(nid);
-        Ok(nid)
+    /// Creates a new node in the graph with the specified parent.
+    fn new_node(&mut self, parent: GenericNodeId, name: impl Into<String>) -> GenericNodeId {
+        self.hierarchy
+            .insert(NodeHierarchy::with_parent(name, parent))
+    }
+
+    fn set_data<T: Any>(&mut self, node_id: GenericNodeId, data: T) -> NodeId<T> {
+        self.data.insert(node_id, Box::new(data));
+        NodeId(node_id, PhantomData)
     }
 }
 
-/// A view of a network scoped to a particular reference node.
-pub struct NetworkScope<'a> {
+pub struct Node<'a> {
     network: &'a mut Network,
-    id: NodeId,
+    id: GenericNodeId,
 }
 
-impl<'a> NetworkScope<'a> {
-    pub fn add_named_node(&mut self, name: impl Into<String>) -> NodeId {
-        self.network.add_named_node(name, self.id).unwrap()
+impl<'a> Node<'a> {
+    pub fn set_data<T: Any>(&mut self, data: T) -> NodeId<T> {
+        self.network.set_data(self.id, data)
+    }
+
+    pub fn subnet(&mut self) -> Subnet {
+        Subnet {
+            network: self.network,
+            parent_node_id: self.id,
+        }
+    }
+
+    pub fn id(&self) -> GenericNodeId {
+        self.id
     }
 }
 
-/// Proxy context for modifying edits.
-///
-/// Use the methods on this object to add/remove nodes and modify parameters.
-///
-/// This will track all dirty nodes. It is created by [Network::modify], which will update
-/// all dirty nodes upon returning from the closure.
-struct NetworkProxy<'a> {
-    n: &'a mut Network,
+pub struct Subnet<'a> {
+    network: &'a mut Network,
+    parent_node_id: GenericNodeId,
 }
 
-impl<'a> NetworkProxy<'a> {
-    pub fn node_mut(&mut self, id: NodeId) -> Result<NodeProxy<'a>> {
-        unimplemented!()
+impl<'a> Subnet<'a> {
+    pub fn new_node<'b>(&'b mut self, name: impl Into<String>) -> Node<'b>
+    where
+        'a: 'b,
+    {
+        let id = self.network.new_node(self.parent_node_id, name);
+        Node {
+            network: self.network,
+            id,
+        }
     }
-
-    pub fn delete_node(&mut self, id: NodeId) -> Result<()> {
-        unimplemented!()
-    }
-}
-
-/// Proxy context for modifying a node.
-///
-/// Tracks modification of parameters and reports them in the dependency graph.
-pub struct NodeProxy<'a> {
-    depgraph: &'a mut Depgraph,
-    node: &'a dyn NodeOps,
 }

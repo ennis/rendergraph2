@@ -1,62 +1,7 @@
 use crate::error::Error;
-use crate::expr::Expr;
-use crate::network::{Network, NodeId, ParamId};
-use specs::world::Builder;
-use specs::{Component, VecStorage};
 use crate::eval::EvalContext;
-use std::rc::Rc;
 use std::any::Any;
-
-
-pub struct Param<T: ?Sized> {
-    v: T
-}
-
-impl<T> Param<T> {
-    //pub fn from_closure(f: impl Fn(&mut EvalContext));
-}
-
-/*
-impl Param {
-    pub fn new(expr: Expr) -> Param {
-        Param { expr }
-    }
-
-    pub fn expr(&self) -> &Expr {
-        &self.expr
-    }
-
-    pub fn set_expr(&mut self, expr: Expr) {
-        self.expr = expr;
-    }
-}*/
-
-// trait Param
-// trait TypedParam<Type=T>: Param
-// OR
-// Param<Value>
-// Param<f32>
-// Param<Any>
-//
-// NodeOps impls Param<Any>, downcastable to Param<<concrete type>>
-// Can coerce Param<T> where T: Any to Param<dyn Any> (unsizing?)
-
-// trait Param
-// trait TypedParam<T>: Param
-// downcast Param -> TypedParam<T>
-
-// SimpleParam
-// -> impl TypedParam
-// -> impl Param
-
-/// A set of parameters to update.
-pub struct ParamUpdateSet
-{
-    dirty: Vec<ParamId>,
-    /// Ok(true) if successfully updated, Ok(false) if not necessary to update, Err(_)
-    /// if error during update.
-    results: Vec<Result<bool,Error>>
-}
+use std::rc::Rc;
 
 //--------------------------------------------------------------------------------------------------
 pub trait NodeOps {
@@ -66,12 +11,6 @@ pub trait NodeOps {
     fn display_node(&self) -> &str {
         self.name()
     }
-    /// Signals to the node that one or more dependencies of this node have changed.
-    ///
-    /// The ParamUpdateSet contains the set of parameters (identified by nodeID+paramID) that were modified.
-    /// The node should update its own parameters and signal which ones have changed through the
-    /// provided ParamUpdateSet.
-    fn dependencies_updated(&mut self, updates: &mut ParamUpdateSet);
 
     // issue here: node ops mut borrows storage of nodes, but needs access to params of other nodes
     // -> could extract (move out) node from storage before, and put it back afterwards
@@ -86,7 +25,7 @@ pub trait NodeOps {
     // -> will happen once per frame, so make it efficient and fast
     //      -> how many param calculations per frame (or per second)
     //      -> say 1000000 params to recalc per frame?
-    //
+    //0
     // dependencies_updated should be called with a context
     // - the context is the full network + whatever custom contexts (identified by type) are relevant
     //      - can query contexts by type (but no typeid for non-'static structs...)
@@ -100,20 +39,26 @@ pub trait NodeOps {
     //      - issue: on param update, must call all systems
     //          - costly? can't do it all at once because of dependencies between nodes (of different types)
 
+    // Network types should have control over what is done (order of execution, etc)
+    // Dependencies are interpreted by all systems as they see fit
+    // Having only the NodeOps trait for interpreting a node graph is not very flexible (must cram everything into the context)
+    //      - Whereas plug-in systems can build their own context and pass them to the nodes as they see fit
+    //
+    // On parameter change
+    // - maybe parameters don't need a custom context?
+    // - all data is going to be 'ectx scoped anyway during parameter change
+    // - need custom context for execution, but maybe not for editor changes?
+    // - in this case, just have a NodeParams component for params and a custom component for the network type
+
+    //
+    // IDEA: parameters are nodes within a subnet, exposed to the user as knobs
+    // -> other nodes can depend on them without needing an eval context for the parent node
+    // -> parameters are ValueNodes
+    //
+    // On creating a node, all params are also created in a subnet
+
     /*/// Returns a reference to a named parameter of the node.
     fn param(&self, name: &str) -> Result<&Param<dyn Any>, Error>;
     /// Returns a mutable reference to a named paramter of the node.
     fn param_mut(&mut self, name: &str) -> Result<&mut Param<dyn Any>, Error>;*/
-}
-
-impl<'a> Any<'a> {
-    fn downcast_ref<T: 'a>(&self) -> Option<&T> { ... }
-
-    // problem: T: 'a is always OK with 'static
-    // want some 'b such that 'a outlives 'b, but the only constraint we can add on the type is T:'b, which is T outlives 'b, which is OK for static
-    // (ran into similar issue with the plugin system)
-    //
-    // T must not be a type, but a type constructor => 'a -> T<'a>; but no higher-kinded type params in rust
-    //
-    // But can have T: BoundedAny<'a>
 }

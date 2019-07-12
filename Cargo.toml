@@ -12,4 +12,12 @@ protoc-grpcio = "1.0.2"
 [dependencies]
 rlua = "0.16.3"
 petgraph = "0.4.13"
-specs = "0.14.3"
+slotmap = { version = "0.3.0", features = ["unstable"] }
+zmq = { version = "0.9.1", features = ["vendored"] }
+serde = { version = "1.0.94", features = ["derive"] }
+rmp = "0.8.7"
+rmp-serde = "0.13.7"
+enum-primitive-derive = "0.1.2"
+num-traits = "0.2.8"
+log = "0.4.6"
+env_logger = "0.6.2"

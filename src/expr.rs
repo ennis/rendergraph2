@@ -1,5 +1,5 @@
 use crate::error::Error;
-use rlua::{FromLua, Lua, ToLua};
+use rlua::ToLua;
 
 //--------------------------------------------------------------------------------------------------
 pub enum Value {

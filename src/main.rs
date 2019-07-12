@@ -1,22 +1,22 @@
-#![feature(coerce_unsized, unsize)]
 use crate::error::Error;
 use crate::eval::{EvalContext, Evaluator};
 use crate::expr::{Expr, Value};
-use crate::network::node::{NodeOps, Param};
-use crate::network::{Network, ParamId};
-use std::collections::HashMap;
-use std::{fmt, ptr};
-use std::fmt::Display;
-use std::ops::CoerceUnsized;
+use crate::network::node::NodeOps;
+use crate::network::{GenericNodeId, Network, NodeId, Subnet};
 use std::any::Any;
-use std::marker::{PhantomData, Unsize};
-use std::rc::Rc;
-use std::cell::RefCell;
+use std::marker::PhantomData;
+use log::{debug,info,warn,error};
+use enum_primitive_derive::Primitive;
 
 mod error;
 mod eval;
 mod expr;
 mod network;
+mod param;
+
+use self::param::Param;
+use zmq::Message;
+use serde::Serialize;
 
 #[derive(Clone, Debug)]
 pub struct FrameContext {
@@ -33,70 +33,6 @@ impl EvalContext for FrameContext {
         }
     }
 }
-
-pub struct TestNode {
-    name: String,
-    //param_1: Param,
-    //param_2: Param,
-}
-
-impl TestNode {
-    pub fn new(name: impl Into<String>) -> TestNode {
-        TestNode {
-            name: name.into(),
-            //param_1: Param::new(Expr::new("0.0")),
-            //param_2: Param::new(Expr::new("0.0")),
-        }
-    }
-}
-
-impl NodeOps for TestNode {
-    fn name(&self) -> &str {
-        "TestNode"
-    }
-
-    /*fn param(&self, name: &str) -> Result<&Param, Error> {
-        match name {
-            "param_1" => Ok(&self.param_1),
-            "param_2" => Ok(&self.param_2),
-            _ => Err(Error::NameNotFound),
-        }
-    }
-
-    fn param_mut(&mut self, name: &str) -> Result<&mut Param, Error> {
-        match name {
-            "param_1" => Ok(&mut self.param_1),
-            "param_2" => Ok(&mut self.param_2),
-            _ => Err(Error::NameNotFound),
-        }
-    }*/
-}
-
-//--------------------------------------------------------------------------------------------------
-
-
-pub struct Param<T>
-{
-    /// Closure called to calculate the value of the parameter
-    v: Box<Fn(&mut dyn EvalContext) -> Result<T, Error>>,
-    /// Cached value
-    cached: Result<T, Error>,
-    /// ID of this parameter in the dependency graph.
-    id: ParamId,
-}
-
-// e.g.
-// A = 1.0
-// B = 2.0
-// C = A+B
-// D = C+2.0
-// E = A+B+D
-//
-// A: {}
-// B: {}
-// C: {A,B}
-// D: {C}
-// E: {A,B,D}
 
 // Who should own the parameter values?
 // - the depgraph
@@ -115,31 +51,81 @@ pub struct Param<T>
 //      - implementors cannot get it wrong, and they have nothing to do
 //      - implementors register dependencies / automatically removed when node deleted
 //              - if the implementor forgets to register a dependency, then simply won't be notified
+//
+// Creating a node:
+// Node::create(network, params) -> NodeId
 
-impl<T> Param<T>
-{
-    /// Creates a parameter that just returns a constant.
-    pub fn constant(v: T) -> Param<T> {
-        Param {
-            v: Box::new(move || v),
-            cached: Err(Error::Other)
-        }
-    }
+//--------------------------------------------------------------------------------------------------
 
-    /// Calculates the parameter.
-    pub fn eval(&mut self, ctx: &mut dyn EvalContext) -> Result<(), Error> {
-        unimplemented!()
-    }
+struct MyNode {
+    param1: NodeId<Param<f32>>,
+    param2: NodeId<Param<f32>>,
+}
 
-    /// Returns the cached value of the parameter.
-    pub fn get(&self) -> Result<&T, Error> {
-        self.v(ctx)
+impl MyNode {
+    pub fn new(mut subnet: Subnet) -> Result<NodeId<MyNode>, Error> {
+        let mut n = subnet.new_node("MyNode"); // borrows subnet (mutably)
+        let param1 = Param::new_constant(n.subnet(), "param1", 3.14)?;
+        let param2 = Param::new_constant(n.subnet(), "param2", 1.65)?;
+
+        let data = MyNode { param1, param2 };
+
+        Ok(n.set_data(data))
     }
 }
 
+//--------------------------------------------------------------------------------------------------
+#[repr(u32)]
+#[derive(Copy,Clone,Debug,Eq,PartialEq,Primitive)]
+pub enum Method {
+    GetVersion = 0,
+    GetNodeInfo = 1,
+    Kill = 2
+}
+
+#[derive(Copy,Clone,Debug,Eq,PartialEq)]
+pub enum NextAction {
+    Continue,
+    Break,
+}
+
+#[derive(Serialize)]
+pub struct VersionReply {
+    version: u32,
+}
+
+pub fn handle_message(net: &mut Network, socket: &zmq::Socket) -> Result<NextAction, String> {
+    let msg = socket.recv_msg(0).map_err(|err| err.to_string())?;
+    let mut msg : &[u8] = &*msg;
+
+    // deserialize the request
+    // this compiles because read_int takes anything that impls FromPrimitive
+    let method : Method = rmp::decode::read_int(&mut msg).map_err(|err| format!("invalid request format: {}", err))?;
+    //let method  = num_traits::FromPrimitive::from_u32(method).ok_or_else(|| "unknown method".to_string())?;
+
+    let next = match method {
+        Method::GetVersion => {
+            let reply_buf = rmp_serde::to_vec(&1u32).unwrap();
+            socket.send(reply_buf, 0);
+            NextAction::Continue
+        },
+        Method::GetNodeInfo => {
+            unimplemented!()
+        },
+        Method::Kill => {
+            NextAction::Break
+        }
+    };
+
+    Ok(next)
+}
+
+const ENDPOINT : &str = "tcp://127.0.0.1:5555";
 
 //--------------------------------------------------------------------------------------------------
 fn main() {
+    env_logger::init();
+
     let mut ctx = Evaluator::with_context(FrameContext {
         frame: 0,
         time: 1.0,
@@ -151,82 +137,34 @@ fn main() {
     let time = Expr::new("v('time') * 2");
     assert_eq!(ctx.eval(&time).unwrap().as_number().unwrap(), 2.0);
 
-    // next stop: nodes
-    // - parameters
-    // - evaluation stack
-
-    let mut n1 = TestNode::new("n1");
-    let mut n2 = TestNode::new("n2");
-
-    // bind n2.param_2 to n1.param_2
-    // DESIGN: there must be a way to resolve the expression immediately
-    // Modifying a node is indirect, done through a NodeContext that points to the node
-    //
-    // add nodes into a container (graph)
-    // call graph.modify(|ctx| { ... }) to get a context for modification
-    // call ctx.set_param(node/id, expr) within closure to set param
-    // context keeps track of the mods in a graph
-    // -> modify returns the list of validation errors for the whole graph
-    //
-    //
-    /*n2.param_mut("param_2")
-        .unwrap()
-        .set_expr(Expr::new("ch('../n1/param_2')"));*/
-
-    // Several things:
-    // - setting parameters should always happen within a context
-    //   so that dependent parameters can be re-evaluated and re-checked if deemed necessary
-    //n1.param_mut("param_1").unwrap().set_expr(Expr::new("1.0"));
-
     let mut net = Network::new();
-    net.open_root().add_named_node("obj");
-    net.open_root().add_named_node("render");
-    net.open_root().add_named_node("scene");
-    net.open_root().add_named_node("present");
+    let node_a = MyNode::new(net.root_node().subnet());
+    let node_b = MyNode::new(net.root_node().subnet());
 
-    //let n = net.get::<NodeType>("/obj/test1").unwrap(); // -> NodeProxy<NodeType>
-    //n.param.bind(n1.param);
-    //n.param.bind2(n1.param, n2.param, |n1,n2| { n1 + n2 } )
+    // Start zmq server
+    let zmq_ctx = zmq::Context::new();
+    let socket = zmq_ctx.socket(zmq::SocketType::REP).expect("could not create zmq socket");
+    socket.bind(ENDPOINT).expect("could not bind zmq socket");
+    info!("Listening on {}", ENDPOINT);
 
-    //println!("Hello, world!");
-
-    // networks are stand-alone objects that contain named nodes
-    // issue: scope of IDs?
-    // - network-local
-    // - global (blackboard-local)
-    //
-    // required relations:
-    // - ID -> name
-    // - name -> ID
-    //
-    // Global ID-map of objects
-    //
-    // - lookup by name
-    // - subnet hierarchy (ID -> parent / children)
-    //
-    // Generational ID
-
-    let par = Par::constant(3.14f32);
-    let par2 : &Par<dyn Any> = &par;
+    loop {
+        let r = handle_message(&mut net, &socket);
+        match r {
+            Err(msg) => {
+                error!("error processing message: {}", msg);
+                panic!()
+            }
+            Ok(next) => {
+                match next {
+                    NextAction::Continue => continue,
+                    NextAction::Break => break
+                }
+            }
+        }
+        // receive requests
+        //let mut msg = zmq::Message::new();
 
 
 
-    //
-    // Cache IDs (or more? pointer addresses?) after lookup.
-
-    // The graph is "just" an ECS.
-    // Actual Nodes implement NodeOps.
-    // Nodes+Parameter of nodes depend on each other.
-    // Parameters are closures that calculate a value from other parameters and context variables.
-    //  - possibly by executing a script (lua/wasm)
-    // Closures are implemented either in pure rust or in lua, or something else.
-    // Closures should be able to tell what their dependencies are.
-    //
-    // -> declare dependencies, shared param code fetches the values and passes them to the closure (bind1/bind2/bind3 ...)
-    //      actual interesting behavior is in the closure
-
-    // 1. Params are just values
-    // 2. Params are closures that return values calculated from a context
-    // 3. Params are closures that respond to change
-    //
+    }
 }
