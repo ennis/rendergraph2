@@ -7,6 +7,8 @@ use std::any::Any;
 use std::marker::PhantomData;
 use log::{debug,info,warn,error};
 use enum_primitive_derive::Primitive;
+use zmq::Message;
+use serde::{Serialize, Serializer, Deserialize};
 
 mod error;
 mod eval;
@@ -15,8 +17,6 @@ mod network;
 mod param;
 
 use self::param::Param;
-use zmq::Message;
-use serde::Serialize;
 
 #[derive(Clone, Debug)]
 pub struct FrameContext {
@@ -75,12 +75,13 @@ impl MyNode {
 }
 
 //--------------------------------------------------------------------------------------------------
-#[repr(u32)]
-#[derive(Copy,Clone,Debug,Eq,PartialEq,Primitive)]
+
+#[derive(Clone,Debug,Eq,PartialEq,Deserialize)]
+#[serde(tag = "method", content = "data")]
 pub enum Method {
-    GetVersion = 0,
-    GetNodeInfo = 1,
-    Kill = 2
+    GetVersion{},
+    GetNodeInfo{},
+    Kill{}
 }
 
 #[derive(Copy,Clone,Debug,Eq,PartialEq)]
@@ -94,25 +95,76 @@ pub struct VersionReply {
     version: u32,
 }
 
+#[derive(Clone,Debug,Eq,PartialEq,Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reply<T> {
+    status: i64,
+    #[serde(skip_serializing_if="Option::is_none")]
+    error_message: Option<String>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    data: Option<T>,
+}
+
+impl<T> Reply<T> {
+    pub fn new_error(status: i64, message: String) -> Reply<T> {
+        Reply {
+            data: None,
+            error_message: Some(message),
+            status
+        }
+    }
+
+    pub fn new(data: T) -> Reply<T> {
+        Reply {
+            data: Some(data),
+            error_message: None,
+            status: 0
+        }
+    }
+}
+
+pub fn make_reply<T: Serialize>(data: &T) -> Vec<u8> {
+    use serde::ser::SerializeStruct;
+    let mut out : Vec<u8> = Vec::new();
+    let mut s = serde_json::Serializer::new(&mut out);
+    let mut state = s.serialize_struct("Reply", 2).unwrap();
+    state.serialize_field("status", &0).unwrap();
+    state.serialize_field("data", &data).unwrap();
+    state.end();
+    out
+}
+
+pub fn make_error_reply(message: &str) -> Vec<u8> {
+    use serde::ser::SerializeStruct;
+    let mut out : Vec<u8> = Vec::new();
+    let mut s = serde_json::Serializer::new(&mut out);
+    let mut state = s.serialize_struct("Reply", 2).unwrap();
+    state.serialize_field("status", &1).unwrap();
+    state.serialize_field("errorMessage", message).unwrap();
+    state.end();
+    out
+}
+
+
 pub fn handle_message(net: &mut Network, socket: &zmq::Socket) -> Result<NextAction, String> {
     let msg = socket.recv_msg(0).map_err(|err| err.to_string())?;
-    let mut msg : &[u8] = &*msg;
+
+    dbg!(msg.as_str().unwrap());
 
     // deserialize the request
     // this compiles because read_int takes anything that impls FromPrimitive
-    let method : Method = rmp::decode::read_int(&mut msg).map_err(|err| format!("invalid request format: {}", err))?;
-    //let method  = num_traits::FromPrimitive::from_u32(method).ok_or_else(|| "unknown method".to_string())?;
+    let method : Method = serde_json::from_slice(&msg).map_err(|err| format!("invalid method call: {}", err))?;
 
     let next = match method {
-        Method::GetVersion => {
-            let reply_buf = rmp_serde::to_vec(&1u32).unwrap();
+        Method::GetVersion{} => {
+            let reply_buf = make_reply(&1i32);
             socket.send(reply_buf, 0);
             NextAction::Continue
         },
-        Method::GetNodeInfo => {
+        Method::GetNodeInfo{} => {
             unimplemented!()
         },
-        Method::Kill => {
+        Method::Kill{} => {
             NextAction::Break
         }
     };
@@ -161,10 +213,5 @@ fn main() {
                 }
             }
         }
-        // receive requests
-        //let mut msg = zmq::Message::new();
-
-
-
     }
 }
