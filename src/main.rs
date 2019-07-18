@@ -3,20 +3,23 @@ use crate::eval::{EvalContext, Evaluator};
 use crate::expr::{Expr, Value};
 use crate::network::node::NodeOps;
 use crate::network::{GenericNodeId, Network, NodeId, Subnet};
+use enum_primitive_derive::Primitive;
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize, Serializer};
 use std::any::Any;
 use std::marker::PhantomData;
-use log::{debug,info,warn,error};
-use enum_primitive_derive::Primitive;
-use zmq::Message;
-use serde::{Serialize, Serializer, Deserialize};
 
 mod error;
 mod eval;
 mod expr;
 mod network;
 mod param;
+mod server;
 
 use self::param::Param;
+use crate::server::{
+    make_error_reply, make_reply, Request, Server, DEFAULT_ENDPOINT, PROTOCOL_VERSION,
+};
 
 #[derive(Clone, Debug)]
 pub struct FrameContext {
@@ -76,108 +79,11 @@ impl MyNode {
 
 //--------------------------------------------------------------------------------------------------
 
-#[derive(Clone,Debug,Eq,PartialEq,Deserialize)]
-#[serde(tag = "method", content = "data")]
-pub enum Method {
-    GetVersion{},
-    GetNodeInfo{},
-    Kill{}
-}
-
-#[derive(Copy,Clone,Debug,Eq,PartialEq)]
-pub enum NextAction {
-    Continue,
-    Break,
-}
-
-#[derive(Serialize)]
-pub struct VersionReply {
-    version: u32,
-}
-
-#[derive(Clone,Debug,Eq,PartialEq,Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Reply<T> {
-    status: i64,
-    #[serde(skip_serializing_if="Option::is_none")]
-    error_message: Option<String>,
-    #[serde(skip_serializing_if="Option::is_none")]
-    data: Option<T>,
-}
-
-impl<T> Reply<T> {
-    pub fn new_error(status: i64, message: String) -> Reply<T> {
-        Reply {
-            data: None,
-            error_message: Some(message),
-            status
-        }
-    }
-
-    pub fn new(data: T) -> Reply<T> {
-        Reply {
-            data: Some(data),
-            error_message: None,
-            status: 0
-        }
-    }
-}
-
-pub fn make_reply<T: Serialize>(data: &T) -> Vec<u8> {
-    use serde::ser::SerializeStruct;
-    let mut out : Vec<u8> = Vec::new();
-    let mut s = serde_json::Serializer::new(&mut out);
-    let mut state = s.serialize_struct("Reply", 2).unwrap();
-    state.serialize_field("status", &0).unwrap();
-    state.serialize_field("data", &data).unwrap();
-    state.end();
-    out
-}
-
-pub fn make_error_reply(message: &str) -> Vec<u8> {
-    use serde::ser::SerializeStruct;
-    let mut out : Vec<u8> = Vec::new();
-    let mut s = serde_json::Serializer::new(&mut out);
-    let mut state = s.serialize_struct("Reply", 2).unwrap();
-    state.serialize_field("status", &1).unwrap();
-    state.serialize_field("errorMessage", message).unwrap();
-    state.end();
-    out
-}
-
-
-pub fn handle_message(net: &mut Network, socket: &zmq::Socket) -> Result<NextAction, String> {
-    let msg = socket.recv_msg(0).map_err(|err| err.to_string())?;
-
-    dbg!(msg.as_str().unwrap());
-
-    // deserialize the request
-    // this compiles because read_int takes anything that impls FromPrimitive
-    let method : Method = serde_json::from_slice(&msg).map_err(|err| format!("invalid method call: {}", err))?;
-
-    let next = match method {
-        Method::GetVersion{} => {
-            let reply_buf = make_reply(&1i32);
-            socket.send(reply_buf, 0);
-            NextAction::Continue
-        },
-        Method::GetNodeInfo{} => {
-            unimplemented!()
-        },
-        Method::Kill{} => {
-            NextAction::Break
-        }
-    };
-
-    Ok(next)
-}
-
-const ENDPOINT : &str = "tcp://127.0.0.1:5555";
-
 //--------------------------------------------------------------------------------------------------
 fn main() {
     env_logger::init();
 
+    /*
     let mut ctx = Evaluator::with_context(FrameContext {
         frame: 0,
         time: 1.0,
@@ -191,27 +97,22 @@ fn main() {
 
     let mut net = Network::new();
     let node_a = MyNode::new(net.root_node().subnet());
-    let node_b = MyNode::new(net.root_node().subnet());
+    let node_b = MyNode::new(net.root_node().subnet());*/
 
-    // Start zmq server
-    let zmq_ctx = zmq::Context::new();
-    let socket = zmq_ctx.socket(zmq::SocketType::REP).expect("could not create zmq socket");
-    socket.bind(ENDPOINT).expect("could not bind zmq socket");
-    info!("Listening on {}", ENDPOINT);
+    let server = Server::new(DEFAULT_ENDPOINT).expect("could not create server");
 
     loop {
-        let r = handle_message(&mut net, &socket);
-        match r {
-            Err(msg) => {
-                error!("error processing message: {}", msg);
-                panic!()
-            }
-            Ok(next) => {
-                match next {
-                    NextAction::Continue => continue,
-                    NextAction::Break => break
-                }
-            }
-        }
+        server.run(|req| {
+            // deserialize the JSON request
+            let req: Request = serde_json::from_str(req)?;
+
+            // got a valid request, forward to handler
+            let rep = match req {
+                Request::GetVersion {} => make_reply(&PROTOCOL_VERSION),
+                _ => make_error_reply("unimplemented"),
+            };
+
+            Ok(rep)
+        });
     }
 }
